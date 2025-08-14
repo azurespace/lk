@@ -11,6 +11,7 @@ MEM_MB=512
 SMP=1
 CPU="cortex-a53"
 ACCEL="auto"  # auto|hvf|none
+GDB=""        # empty or tcp::PORT; when set, start paused (-S)
 
 usage() {
   cat <<EOF
@@ -22,6 +23,7 @@ Options:
   -s, --smp N        Number of CPUs (default: ${SMP})
   --hvf              Force HVF acceleration (macOS only)
   --no-accel         Disable acceleration (TCG)
+  --gdb [PORT]       Start QEMU gdb server (default 1234) and pause at reset
   -h, --help         Show this help
 
 Notes:
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     -s|--smp)    SMP="$2"; shift 2 ;;
     --hvf)       ACCEL="hvf"; shift ;;
     --no-accel)  ACCEL="none"; shift ;;
+    --gdb)       if [[ $# -ge 2 && $2 != -* ]]; then GDB="tcp::$2"; shift 2; else GDB="tcp::1234"; shift; fi ;;
     -h|--help)   usage; exit 0 ;;
     --)          shift; ARGS+=("$@"); break ;;
     *)           ARGS+=("$1"); shift ;;
@@ -81,7 +84,7 @@ exec qemu-system-aarch64 \
   -m "${MEM_MB}" \
   -machine "${MACHINE_STR}" \
   ${ACCEL_ARGS[@]+"${ACCEL_ARGS[@]}"} \
+  ${GDB:+-S -gdb ${GDB}} \
   -nographic \
   -kernel "${ELF}" \
   ${ARGS[@]+"${ARGS[@]}"}
-
