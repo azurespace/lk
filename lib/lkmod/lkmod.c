@@ -109,19 +109,24 @@ static status_t parse_and_load(const uint8_t *blob, size_t len, void **base_out,
                                struct Elf64_Dyn **dynamic_out, uint64_t *min_vaddr_out,
                                struct Elf64_Ehdr *ehdr_out, struct Elf64_Phdr **phdrs_out,
                                bool *used_vmm_out) {
-    if (len < sizeof(struct Elf64_Ehdr)) return ERR_NOT_VALID;
-    const struct Elf64_Ehdr *eh = (const struct Elf64_Ehdr *)blob;
-    if (memcmp(eh->e_ident, ELF_MAGIC, 4) != 0) return ERR_NOT_VALID;
-    if (eh->e_ident[EI_CLASS] != ELFCLASS64) return ERR_NOT_VALID;
-    if (eh->e_ident[EI_DATA] != ELFDATA2LSB) return ERR_NOT_VALID; // AArch64 LE only
-    if (eh->e_machine != EM_AARCH64) return ERR_NOT_VALID;
-    if (eh->e_type != ET_DYN) return ERR_NOT_SUPPORTED;
-    if (eh->e_phoff == 0 || eh->e_phnum == 0) return ERR_NOT_VALID;
-    if (eh->e_phentsize != sizeof(struct Elf64_Phdr)) return ERR_NOT_VALID;
-    if (eh->e_ehsize != sizeof(struct Elf64_Ehdr)) return ERR_NOT_VALID;
-
-    if (eh->e_phoff + (size_t)eh->e_phnum * sizeof(struct Elf64_Phdr) > len)
+    if (len < sizeof(struct Elf64_Ehdr)) {
+        printf("lkmod: invalid ELF (too small)\n");
         return ERR_NOT_VALID;
+    }
+    const struct Elf64_Ehdr *eh = (const struct Elf64_Ehdr *)blob;
+    if (memcmp(eh->e_ident, ELF_MAGIC, 4) != 0) { printf("lkmod: invalid ELF magic\n"); return ERR_NOT_VALID; }
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64) { printf("lkmod: unsupported ELF class %u\n", eh->e_ident[EI_CLASS]); return ERR_NOT_VALID; }
+    if (eh->e_ident[EI_DATA] != ELFDATA2LSB) { printf("lkmod: unsupported endianness\n"); return ERR_NOT_VALID; } // AArch64 LE only
+    if (eh->e_machine != EM_AARCH64) { printf("lkmod: wrong machine %u (need AArch64)\n", eh->e_machine); return ERR_NOT_VALID; }
+    if (eh->e_type != ET_DYN) { printf("lkmod: ELF type %u not supported (need ET_DYN)\n", eh->e_type); return ERR_NOT_SUPPORTED; }
+    if (eh->e_phoff == 0 || eh->e_phnum == 0) { printf("lkmod: no program headers\n"); return ERR_NOT_VALID; }
+    if (eh->e_phentsize != sizeof(struct Elf64_Phdr)) { printf("lkmod: bad phentsize %u\n", eh->e_phentsize); return ERR_NOT_VALID; }
+    if (eh->e_ehsize != sizeof(struct Elf64_Ehdr)) { printf("lkmod: bad ehsize %u\n", eh->e_ehsize); return ERR_NOT_VALID; }
+
+    if (eh->e_phoff + (size_t)eh->e_phnum * sizeof(struct Elf64_Phdr) > len) {
+        printf("lkmod: phdrs beyond blob length\n");
+        return ERR_NOT_VALID;
+    }
     const struct Elf64_Phdr *ph = (const struct Elf64_Phdr *)(blob + eh->e_phoff);
 
     // Compute load span
@@ -133,7 +138,7 @@ static status_t parse_and_load(const uint8_t *blob, size_t len, void **base_out,
         uint64_t end = ph[i].p_vaddr + ph[i].p_memsz;
         if (end > maxva) maxva = end;
     }
-    if (minva == UINT64_MAX || maxva <= minva) return ERR_NOT_FOUND;
+    if (minva == UINT64_MAX || maxva <= minva) { printf("lkmod: no PT_LOAD segments\n"); return ERR_NOT_FOUND; }
 
     // Page align
     uint64_t page_mask = PAGE_SIZE - 1;
@@ -163,6 +168,7 @@ static status_t parse_and_load(const uint8_t *blob, size_t len, void **base_out,
         if (ph[i].p_type != PT_LOAD) continue;
         if (ph[i].p_filesz == 0 && ph[i].p_memsz == 0) continue;
         if (ph[i].p_offset + ph[i].p_filesz > len) {
+            printf("lkmod: segment %u exceeds blob (offs=%" PRIu64 ", sz=%" PRIu64 ")\n", i, (uint64_t)ph[i].p_offset, (uint64_t)ph[i].p_filesz);
             page_free(base, pages);
             return ERR_NOT_VALID;
         }
@@ -296,6 +302,8 @@ static status_t do_relocations(void *base, size_t span, uint64_t minva, struct E
                     const struct Elf64_Sym *s = &(*dynsym_out)[symi];
                     if (symi >= dynsym_count) dynsym_count = symi + 1;
                     if (s->st_shndx == SHN_UNDEF) {
+                        const char *nm = (*dynstr_out && s) ? (*dynstr_out + s->st_name) : "<undef>";
+                        printf("lkmod: undefined symbol '%s' in ABS64 relocation\n", nm);
                         return ERR_NOT_SUPPORTED;
                     }
                     uint64_t load_bias = (uint64_t)((uintptr_t)base - minva);
@@ -317,7 +325,7 @@ static status_t do_relocations(void *base, size_t span, uint64_t minva, struct E
                 case R_AARCH64_NONE:
                     break;
                 default:
-                    LTRACEF("unsupported relocation type %u\n", type);
+                    printf("lkmod: unsupported relocation type %u in .rela.dyn\n", type);
                     return ERR_NOT_SUPPORTED;
             }
         }
@@ -353,7 +361,7 @@ static status_t do_relocations(void *base, size_t span, uint64_t minva, struct E
                 case R_AARCH64_NONE:
                     break;
                 default:
-                    LTRACEF("unsupported relocation type %u (plt)\n", type);
+                    printf("lkmod: unsupported relocation type %u in .rela.plt\n", type);
                     return ERR_NOT_SUPPORTED;
             }
         }
@@ -413,7 +421,11 @@ status_t lkmod_load_from_memory(const void *blob, size_t len, const lkmod_api_t 
     }
     lkmod_exit_fn fini = (lkmod_exit_fn)find_symbol_addr(base, minva, dynsym, dynsym_count, dynstr, "lkmod_exit");
 
-    if (!init) { page_free(base, span / PAGE_SIZE); return ERR_NOT_FOUND; }
+    if (!init) {
+        printf("lkmod: missing entry 'lkmod_init'\n");
+        page_free(base, span / PAGE_SIZE);
+        return ERR_NOT_FOUND;
+    }
 
     lkmod_module_t *mod = (lkmod_module_t *)calloc(1, sizeof(*mod));
     if (!mod) { page_free(base, span / PAGE_SIZE); return ERR_NO_MEMORY; }
@@ -434,6 +446,7 @@ status_t lkmod_load_from_memory(const void *blob, size_t len, const lkmod_api_t 
     void *user_handle = NULL;
     int rc = mod->init(use_api, &user_handle);
     if (rc != 0) {
+        printf("lkmod: lkmod_init returned error %d\n", rc);
         page_free(base, span / PAGE_SIZE);
         free(mod);
         return ERR_GENERIC;
@@ -534,4 +547,17 @@ lkmod_module_t *lkmod_find_by_name(const char *name) {
     }
     mutex_release(&g_modules_lock);
     return NULL;
+}
+
+const char *lkmod_status_str(status_t status) {
+    switch (status) {
+        case NO_ERROR: return "NO_ERROR";
+        case ERR_NOT_VALID: return "ERR_NOT_VALID";
+        case ERR_NOT_SUPPORTED: return "ERR_NOT_SUPPORTED";
+        case ERR_NOT_FOUND: return "ERR_NOT_FOUND";
+        case ERR_INVALID_ARGS: return "ERR_INVALID_ARGS";
+        case ERR_NO_MEMORY: return "ERR_NO_MEMORY";
+        case ERR_GENERIC: return "ERR_GENERIC";
+        default: return "ERR_UNKNOWN";
+    }
 }

@@ -48,6 +48,9 @@ status_t lkmod_call4(const lkmod_module_t *mod, const char *symname,
                      int64_t a0, int64_t a1, int64_t a2, int64_t a3,
                      int64_t *ret_out);
 
+// Convenience: convert common error codes to short strings for logs.
+const char *lkmod_status_str(status_t status);
+
 // Module registry helpers
 // Get the first/last loaded module (or NULL if none).
 lkmod_module_t *lkmod_first_loaded(void);

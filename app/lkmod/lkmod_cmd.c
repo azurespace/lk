@@ -30,7 +30,7 @@ static int cmd_mod(int argc, const console_cmd_args *argv) {
         lkmod_module_t *mod = NULL;
         status_t st = lkmod_load_from_memory(addr, size, NULL, &mod);
         if (st < 0) {
-            printf("load failed: %d\n", st);
+            printf("load failed: %s(%d)\n", lkmod_status_str(st), st);
         } else {
             g_last_mod = mod;
             printf("loaded module %s @ %p size %zu\n", lkmod_name(mod), (void *)lkmod_base(mod), lkmod_size(mod));
