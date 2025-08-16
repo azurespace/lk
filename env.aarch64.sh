@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # Helper to set PATH for aarch64-elf toolchain and provide a QEMU runner.
 
-set -euo pipefail
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
 
 # Prefer the x86_64 toolchain (works via Rosetta on Apple Silicon).
