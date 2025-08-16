@@ -18,6 +18,7 @@
 #include <kernel/vm.h>
 #include <kernel/thread.h>
 #include <kernel/timer.h>
+#include <kernel/mutex.h>
 #include <platform/time.h>
 #include <arch/ops.h>
 
@@ -73,6 +74,7 @@ struct lkmod_module {
 };
 
 static struct list_node g_modules = LIST_INITIAL_VALUE(g_modules);
+static mutex_t g_modules_lock = MUTEX_INITIAL_VALUE(g_modules_lock);
 
 static uint64_t now_ticks(void) {
     return (uint64_t)current_time();
@@ -84,12 +86,19 @@ static void api_log(const char *msg) {
     }
 }
 
+static void api_issue(int queue_id, void *command) {
+    // Default stub: log the request; real platforms may route to a queue
+    (void)command;
+    printf("lkmod: issue(queue=%d, cmd=%p)\n", queue_id, command);
+}
+
 static lkmod_api_t default_api = {
     .log = api_log,
     .printf = printf,
     .alloc = malloc,
     .free = free,
     .ticks = now_ticks,
+    .issue = api_issue,
 };
 
 static inline void *va_from_image(void *base, uint64_t min_vaddr, uint64_t vaddr) {
@@ -431,14 +440,18 @@ status_t lkmod_load_from_memory(const void *blob, size_t len, const lkmod_api_t 
     }
     mod->user_handle = user_handle;
 
+    mutex_acquire(&g_modules_lock);
     list_add_tail(&g_modules, &mod->node);
+    mutex_release(&g_modules_lock);
     *out_mod = mod;
     return NO_ERROR;
 }
 
 status_t lkmod_unload(lkmod_module_t *mod) {
     if (!mod) return ERR_INVALID_ARGS;
+    mutex_acquire(&g_modules_lock);
     list_delete(&mod->node);
+    mutex_release(&g_modules_lock);
     if (mod->fini) {
         // Best-effort; assume success
         (void)mod->fini(mod->user_handle);
@@ -482,27 +495,43 @@ status_t lkmod_call4(const lkmod_module_t *mod, const char *symname,
 }
 
 lkmod_module_t *lkmod_first_loaded(void) {
+    mutex_acquire(&g_modules_lock);
     lkmod_module_t *m = list_peek_head_type(&g_modules, lkmod_module_t, node);
+    mutex_release(&g_modules_lock);
     return m;
 }
 
 lkmod_module_t *lkmod_last_loaded(void) {
+    mutex_acquire(&g_modules_lock);
     lkmod_module_t *m = list_peek_tail_type(&g_modules, lkmod_module_t, node);
+    mutex_release(&g_modules_lock);
     return m;
 }
 
 lkmod_module_t *lkmod_next(lkmod_module_t *prev) {
+    mutex_acquire(&g_modules_lock);
+    lkmod_module_t *ret;
     if (!prev) {
-        return list_peek_head_type(&g_modules, lkmod_module_t, node);
+        ret = list_peek_head_type(&g_modules, lkmod_module_t, node);
+    } else {
+        ret = list_next_type(&g_modules, &prev->node, lkmod_module_t, node);
     }
-    return list_next_type(&g_modules, &prev->node, lkmod_module_t, node);
+    mutex_release(&g_modules_lock);
+    return ret;
 }
 
 lkmod_module_t *lkmod_find_by_name(const char *name) {
     if (!name) return NULL;
-    for (lkmod_module_t *m = lkmod_next(NULL); m; m = lkmod_next(m)) {
+    mutex_acquire(&g_modules_lock);
+    lkmod_module_t *m = list_peek_head_type(&g_modules, lkmod_module_t, node);
+    while (m) {
         const char *n = lkmod_name(m);
-        if (n && strcmp(n, name) == 0) return m;
+        if (n && strcmp(n, name) == 0) {
+            mutex_release(&g_modules_lock);
+            return m;
+        }
+        m = list_next_type(&g_modules, &m->node, lkmod_module_t, node);
     }
+    mutex_release(&g_modules_lock);
     return NULL;
 }

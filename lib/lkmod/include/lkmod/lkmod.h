@@ -17,6 +17,8 @@ typedef struct lkmod_api {
     void *(*alloc)(size_t size);
     void (*free)(void *ptr);
     uint64_t (*ticks)(void);
+    // Issue a command to a queue (opaque to modules)
+    void (*issue)(int queue_id, void *command);
 } lkmod_api_t;
 
 // Opaque module handle

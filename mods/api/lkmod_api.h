@@ -8,6 +8,7 @@ typedef struct lkmod_api {
     void *(*alloc)(size_t size);
     void (*free)(void *ptr);
     uint64_t (*ticks)(void);
+    void (*issue)(int queue_id, void *command);
 } lkmod_api_t;
 
 #ifdef __cplusplus
@@ -21,4 +22,3 @@ int lkmod_exit(void *handle);
 #ifdef __cplusplus
 } // extern "C"
 #endif
-
