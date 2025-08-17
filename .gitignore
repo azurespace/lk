@@ -19,3 +19,6 @@ tags
 toolchain
 .cache
 vmlinux
+
+# Ignore built module blobs
+mods/**/*.so
