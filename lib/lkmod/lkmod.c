@@ -24,6 +24,15 @@
 
 #define LOCAL_TRACE 0
 
+// Loader tuning and profiling
+#ifndef LKMOD_PROFILE
+#define LKMOD_PROFILE 1
+#endif
+#ifndef LKMOD_SYNC_ONLY_TEXT
+#define LKMOD_SYNC_ONLY_TEXT 1
+#endif
+
+
 // AArch64 relocation types (not defined elsewhere in this tree)
 #ifndef R_AARCH64_NONE
 #define R_AARCH64_NONE      0
@@ -105,6 +114,23 @@ static inline void *va_from_image(void *base, uint64_t min_vaddr, uint64_t vaddr
     return (uint8_t *)base + (vaddr - min_vaddr);
 }
 
+
+/* Flush instruction/data caches for executable regions only to reduce latency */
+static void sync_exec_segments(void *base, uint64_t minva,
+                               const struct Elf64_Ehdr *eh, const struct Elf64_Phdr *ph) {
+#if LKMOD_SYNC_ONLY_TEXT
+    if (!eh || !ph) return;
+    for (uint i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        if ((ph[i].p_flags & PF_X) == 0) continue;
+        if (ph[i].p_memsz == 0) continue;
+        void *seg = va_from_image(base, minva, ph[i].p_vaddr);
+        arch_sync_cache_range((addr_t)seg, (size_t)ph[i].p_memsz);
+    }
+#else
+    (void)base; (void)minva; (void)eh; (void)ph;
+#endif
+}
 static status_t parse_and_load(const uint8_t *blob, size_t len, void **base_out, size_t *size_out,
                                struct Elf64_Dyn **dynamic_out, uint64_t *min_vaddr_out,
                                struct Elf64_Ehdr *ehdr_out, struct Elf64_Phdr **phdrs_out,
@@ -369,8 +395,6 @@ static status_t do_relocations(void *base, size_t span, uint64_t minva, struct E
 
     *dynsym_count_out = dynsym_count;
 
-    // I/D cache coherency
-    arch_sync_cache_range((addr_t)base, span);
     return NO_ERROR;
 }
 
@@ -393,6 +417,10 @@ status_t lkmod_load_from_memory(const void *blob, size_t len, const lkmod_api_t 
 
     void *base = NULL; size_t span = 0; struct Elf64_Dyn *dyn = NULL;
     uint64_t minva = 0; struct Elf64_Ehdr eh; struct Elf64_Phdr *ph = NULL; bool used_vmm = false;
+    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+#if LKMOD_PROFILE
+    t0 = now_ticks();
+#endif
     status_t st = parse_and_load((const uint8_t *)blob, len, &base, &span, &dyn, &minva, &eh, &ph, &used_vmm);
     if (st < 0) return st;
 
@@ -410,6 +438,20 @@ status_t lkmod_load_from_memory(const void *blob, size_t len, const lkmod_api_t 
 #endif
         return st;
     }
+
+#if LKMOD_PROFILE
+    t1 = now_ticks();
+#endif
+
+#if LKMOD_SYNC_ONLY_TEXT
+    sync_exec_segments(base, minva, &eh, ph);
+#else
+    arch_sync_cache_range((addr_t)base, span);
+#endif
+
+#if LKMOD_PROFILE
+    t2 = now_ticks();
+#endif
 
     // Resolve entry: prefer symbol name if e_entry is unset
     lkmod_init_fn init = NULL;
@@ -445,6 +487,9 @@ status_t lkmod_load_from_memory(const void *blob, size_t len, const lkmod_api_t 
     const lkmod_api_t *use_api = api ? api : &default_api;
     void *user_handle = NULL;
     int rc = mod->init(use_api, &user_handle);
+#if LKMOD_PROFILE
+    t3 = now_ticks();
+#endif
     if (rc != 0) {
         printf("lkmod: lkmod_init returned error %d\n", rc);
         page_free(base, span / PAGE_SIZE);
@@ -457,6 +502,13 @@ status_t lkmod_load_from_memory(const void *blob, size_t len, const lkmod_api_t 
     list_add_tail(&g_modules, &mod->node);
     mutex_release(&g_modules_lock);
     *out_mod = mod;
+#if LKMOD_PROFILE
+    printf("lkmod: load timings parse+reloc=%llu us, icache=%llu us, init=%llu us (total=%llu us)\n",
+           (unsigned long long)(t1 - t0),
+           (unsigned long long)(t2 - t1),
+           (unsigned long long)(t3 - t2),
+           (unsigned long long)(t3 - t0));
+#endif
     return NO_ERROR;
 }
 
