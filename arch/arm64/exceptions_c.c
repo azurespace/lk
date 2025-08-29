@@ -10,6 +10,8 @@
 #include <lk/bits.h>
 #include <arch/arch_ops.h>
 #include <arch/arm64.h>
+#include <kernel/thread.h>
+#include <kernel/vm.h>
 
 #define SHUTDOWN_ON_FATAL 1
 
@@ -159,6 +161,8 @@ __WEAK void arm64_syscall(struct arm64_iframe_long *iframe, bool is_64bit) {
 
 void arm64_sync_exception(struct arm64_iframe_long *iframe);
 void arm64_sync_exception(struct arm64_iframe_long *iframe) {
+    /* no local helpers in C */
+
     struct fault_handler_table_entry *fault_handler;
     uint32_t esr = ARM64_READ_SYSREG(esr_el1);
     uint32_t ec = BITS_SHIFT(esr, 31, 26);
@@ -181,12 +185,26 @@ void arm64_sync_exception(struct arm64_iframe_long *iframe) {
             arm64_syscall(iframe, (ec == 0x15) ? true : false);
             return;
 #endif
-        case 0b100000: /* instruction abort from lower level */
+        case 0b100000: /* instruction abort from lower level (EL0) */
+            {
+                uint64_t far = ARM64_READ_SYSREG(far_el1);
+                printf("user fault: instr abort (EL0): PC 0x%llx FAR 0x%llx ESR 0x%x ISS 0x%x\n",
+                       iframe->elr, far, esr, iss);
+                thread_exit(ERR_FAULT);
+            }
+            __UNREACHABLE;
         case 0b100001: /* instruction abort from same level */
             printf("instruction abort: PC at 0x%llx\n", iframe->elr);
             print_fault_msg(BITS(iss, 5, 0));
             break;
-        case 0b100100: /* data abort from lower level */
+        case 0b100100: /* data abort from lower level (EL0) */
+            {
+                uint64_t far = ARM64_READ_SYSREG(far_el1);
+                printf("user fault: data abort (EL0): PC 0x%llx FAR 0x%llx ISS 0x%x (DFSC 0x%lx)\n",
+                       iframe->elr, far, iss, BITS(iss, 5, 0));
+                thread_exit(ERR_FAULT);
+            }
+            __UNREACHABLE;
         case 0b100101: { /* data abort from same level */
             for (fault_handler = __fault_handler_table_start;
                     fault_handler < __fault_handler_table_end;

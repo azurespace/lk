@@ -24,6 +24,9 @@ else
 MODULE_DEPS += kernel/novm
 endif
 
+# minimal syscall layer
+MODULE_DEPS += kernel/syscall
+
 MODULE_OPTIONS := extra_warnings
 
 include make/module.mk

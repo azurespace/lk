@@ -9,6 +9,8 @@
 #include <string.h>
 
 #include <lkmod/lkmod.h>
+#include <lkmod/lkmod_el0.h>
+#include <kernel/vm.h>
 #include <lib/page_alloc.h>
 
 #define LOCAL_TRACE 0
@@ -34,6 +36,28 @@ static int cmd_mod(int argc, const console_cmd_args *argv) {
         } else {
             g_last_mod = mod;
             printf("loaded module %s @ %p size %zu\n", lkmod_name(mod), (void *)lkmod_base(mod), lkmod_size(mod));
+        }
+        return 0;
+    }
+
+    if (!strcmp(argv[1].str, "uloadat") && argc >= 4) {
+        void *addr = argv[2].p;
+        size_t size = (size_t)argv[3].u;
+        vmm_aspace_t *uas = NULL;
+        status_t st = vmm_create_aspace(&uas, "mod-el0", 0);
+        if (st < 0 || !uas) {
+            printf("el0 aspace create failed: %d\n", st);
+            return 0;
+        }
+        vaddr_t ubase = 0, entry = 0; uint64_t minva = 0; size_t span = 0;
+        st = lkmod_el0_load_image(uas, addr, size, &ubase, &minva, &span, &entry);
+        if (st < 0) {
+            printf("el0 load failed: %s(%d)\n", lkmod_status_str(st), st);
+            (void)vmm_free_aspace(uas);
+        } else {
+            printf("el0 loaded UVA base=%p span=%zu entry=%p (minva=%llx)\n",
+                   (void *)ubase, span, (void *)entry, (unsigned long long)minva);
+            // Keep aspace alive so user can experiment (no unload yet)
         }
         return 0;
     }
@@ -138,6 +162,7 @@ usage:
     printf("Usage:\n");
     printf("  mod alloc <size>            # alloc scratch buffer (prints address)\n");
     printf("  mod loadat <addr> <size>    # load ELF module from memory\n");
+    printf("  mod uloadat <addr> <size>   # load ELF into a fresh EL0 aspace (prototype)\n");
     printf("  mod call <symbol> [a0..a3]   # call function in last/builtin module\n");
     printf("  mod list                     # list loaded modules (* = selected)\n");
     printf("  mod select <index>           # select a module by index\n");
