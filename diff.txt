@@ -1,0 +1,502 @@
+diff --git a/lib/lkmodmgr/gaia_module_manager.cpp b/lib/lkmodmgr/gaia_module_manager.cpp
+new file mode 100644
+index 00000000..448f25b6
+--- /dev/null
++++ b/lib/lkmodmgr/gaia_module_manager.cpp
+@@ -0,0 +1,292 @@
++// C++ slot-based module manager implementation over lib/lkmod.
++
++#include <lkmod/gaia_module_manager.h>
++
++#include <lk/trace.h>
++#include <lk/debug.h>
++#include <string.h>
++#include <stdlib.h>
++
++#include <arch/atomic.h>
++#include <kernel/mutex.h>
++#include <lib/page_alloc.h>
++
++#define LOCAL_TRACE 0
++
++struct GaiaModuleManager::Slot {
++    void *blob = nullptr;
++    size_t blob_size = 0;
++    lkmod_module_t *mod = nullptr;
++    SlotState state = SlotState::Empty;
++    char entry_symbol[64] = {0};
++    volatile int inflight_calls = 0;
++};
++
++// ---- Handle implementation ----
++GaiaModuleManager::Handle::~Handle() {
++    release();
++}
++
++void GaiaModuleManager::Handle::release() {
++    if (!mgr_) return;
++    GaiaModuleManager::Slot *s = &mgr_->slots_[slot_id_];
++    atomic_add(&s->inflight_calls, -1);
++    mgr_ = nullptr;
++    slot_id_ = 0;
++}
++
++status_t GaiaModuleManager::Handle::call(const char *sym,
++                                         int64_t a0, int64_t a1, int64_t a2, int64_t a3,
++                                         int64_t *ret_out) const {
++    if (!mgr_) return ERR_BAD_STATE;
++    return mgr_->call(slot_id_, sym, a0, a1, a2, a3, ret_out);
++}
++
++status_t GaiaModuleManager::init(const Config &cfg) {
++    if (inited_) return ERR_BAD_STATE;
++    if (cfg.slot_capacity == 0) return ERR_INVALID_ARGS;
++
++    slot_capacity_ = cfg.slot_capacity;
++    api_ = cfg.api;
++    pool_owned_ = false;
++
++    mutex_init(&lock_);
++
++    if (cfg.pool_base) {
++        if (cfg.pool_size == 0) return ERR_INVALID_ARGS;
++        pool_ = cfg.pool_base;
++        pool_size_ = cfg.pool_size;
++        if (cfg.slot_count) {
++            slot_count_ = cfg.slot_count;
++            if ((size_t)slot_count_ * slot_capacity_ > pool_size_) {
++                return ERR_OUT_OF_RANGE;
++            }
++        } else {
++            slot_count_ = (uint32_t)(pool_size_ / slot_capacity_);
++        }
++        if (slot_count_ == 0) return ERR_NO_MEMORY;
++    } else {
++        if (cfg.slot_count == 0) return ERR_INVALID_ARGS;
++        slot_count_ = cfg.slot_count;
++        size_t want = (size_t)slot_count_ * slot_capacity_;
++        size_t pages = (want + PAGE_SIZE - 1) / PAGE_SIZE;
++        void *pool = page_alloc(pages, PAGE_ALLOC_ANY_ARENA);
++        if (!pool) return ERR_NO_MEMORY;
++        pool_ = pool;
++        pool_size_ = pages * PAGE_SIZE;
++        pool_owned_ = true;
++    }
++
++    // Allocate slot table
++    slots_ = (Slot *)calloc(slot_count_, sizeof(Slot));
++    if (!slots_) {
++        if (pool_owned_ && pool_) page_free(pool_, pool_size_ / PAGE_SIZE);
++        pool_ = nullptr;
++        pool_size_ = 0;
++        slot_count_ = 0;
++        return ERR_NO_MEMORY;
++    }
++
++    // Wire blob pointers per slot
++    uint8_t *base = (uint8_t *)pool_;
++    for (uint32_t i = 0; i < slot_count_; i++) {
++        slots_[i].blob = base + (size_t)i * slot_capacity_;
++        slots_[i].blob_size = 0;
++        slots_[i].state = SlotState::Empty;
++        slots_[i].mod = nullptr;
++        slots_[i].entry_symbol[0] = '\0';
++        slots_[i].inflight_calls = 0;
++    }
++
++    inited_ = true;
++    return NO_ERROR;
++}
++
++GaiaModuleManager::~GaiaModuleManager() {
++    if (inited_) {
++        (void)shutdown();
++    }
++}
++
++status_t GaiaModuleManager::shutdown() {
++    if (!inited_) return ERR_BAD_STATE;
++    status_t ret = NO_ERROR;
++    // Attempt to unload all loaded modules without blocking ongoing calls.
++    mutex_acquire(&lock_);
++    for (uint32_t i = 0; i < slot_count_; i++) {
++        Slot &s = slots_[i];
++        if (s.state == SlotState::Loaded && s.mod) {
++            if (s.inflight_calls != 0) {
++                ret = ERR_BUSY; // caller should ensure no active users
++                continue;
++            }
++            lkmod_module_t *m = s.mod;
++            s.mod = nullptr;
++            s.state = (s.blob_size > 0) ? SlotState::Registered : SlotState::Empty;
++            mutex_release(&lock_);
++            (void)lkmod_unload(m);
++            mutex_acquire(&lock_);
++        }
++    }
++    mutex_release(&lock_);
++
++    if (ret == NO_ERROR) {
++        if (pool_owned_ && pool_) {
++            page_free(pool_, pool_size_ / PAGE_SIZE);
++        }
++        free(slots_);
++        slots_ = nullptr;
++        pool_ = nullptr;
++        pool_size_ = 0;
++        slot_count_ = 0;
++        inited_ = false;
++    }
++    return ret;
++}
++
++status_t GaiaModuleManager::register_blob(uint32_t slot_id, const void *blob, size_t len, bool overwrite) {
++    if (!valid_slot(slot_id) || !blob || len == 0) return ERR_INVALID_ARGS;
++    if (len > slot_capacity_) return ERR_TOO_BIG;
++    mutex_acquire(&lock_);
++    Slot &s = slots_[slot_id];
++    if (s.state == SlotState::Loaded) { mutex_release(&lock_); return ERR_BUSY; }
++    if (s.state == SlotState::Registered && !overwrite) { mutex_release(&lock_); return ERR_ALREADY_EXISTS; }
++    memcpy(s.blob, blob, len);
++    s.blob_size = len;
++    s.state = SlotState::Registered;
++    mutex_release(&lock_);
++    return NO_ERROR;
++}
++
++status_t GaiaModuleManager::unregister_blob(uint32_t slot_id) {
++    if (!valid_slot(slot_id)) return ERR_INVALID_ARGS;
++    mutex_acquire(&lock_);
++    Slot &s = slots_[slot_id];
++    if (s.state == SlotState::Loaded) { mutex_release(&lock_); return ERR_BUSY; }
++    s.blob_size = 0;
++    s.state = SlotState::Empty;
++    mutex_release(&lock_);
++    return NO_ERROR;
++}
++
++status_t GaiaModuleManager::load(uint32_t slot_id) {
++    if (!valid_slot(slot_id)) return ERR_INVALID_ARGS;
++    mutex_acquire(&lock_);
++    Slot &s = slots_[slot_id];
++    if (s.state == SlotState::Loaded) { mutex_release(&lock_); return ERR_ALREADY_EXISTS; }
++    if (s.blob_size == 0) { mutex_release(&lock_); return ERR_NOT_FOUND; }
++    const void *blob = s.blob;
++    size_t len = s.blob_size;
++    mutex_release(&lock_);
++
++    lkmod_module_t *mod = nullptr;
++    status_t st = lkmod_load_from_memory(blob, len, api_, &mod);
++    if (st < 0) return st;
++
++    mutex_acquire(&lock_);
++    s.mod = mod;
++    s.state = SlotState::Loaded;
++    mutex_release(&lock_);
++    return NO_ERROR;
++}
++
++status_t GaiaModuleManager::unload(uint32_t slot_id) {
++    if (!valid_slot(slot_id)) return ERR_INVALID_ARGS;
++    mutex_acquire(&lock_);
++    Slot &s = slots_[slot_id];
++    if (s.state != SlotState::Loaded || !s.mod) { mutex_release(&lock_); return ERR_NOT_FOUND; }
++    if (s.inflight_calls != 0) { mutex_release(&lock_); return ERR_BUSY; }
++    lkmod_module_t *mod = s.mod;
++    s.mod = nullptr;
++    s.state = (s.blob_size > 0) ? SlotState::Registered : SlotState::Empty;
++    mutex_release(&lock_);
++    return lkmod_unload(mod);
++}
++
++status_t GaiaModuleManager::set_entry(uint32_t slot_id, const char *symbol) {
++    if (!valid_slot(slot_id)) return ERR_INVALID_ARGS;
++    mutex_acquire(&lock_);
++    Slot &s = slots_[slot_id];
++    if (!symbol) {
++        s.entry_symbol[0] = '\0';
++    } else {
++        size_t n = strnlen(symbol, sizeof(s.entry_symbol) - 1);
++        memcpy(s.entry_symbol, symbol, n);
++        s.entry_symbol[n] = '\0';
++    }
++    mutex_release(&lock_);
++    return NO_ERROR;
++}
++
++const char *GaiaModuleManager::get_entry(uint32_t slot_id) const {
++    if (!valid_slot(slot_id)) return nullptr;
++    mutex_acquire(&lock_);
++    const char *ret = (slots_[slot_id].entry_symbol[0] != '\0') ? slots_[slot_id].entry_symbol : nullptr;
++    mutex_release(&lock_);
++    return ret;
++}
++
++status_t GaiaModuleManager::call(uint32_t slot_id, const char *sym,
++                                 int64_t a0, int64_t a1, int64_t a2, int64_t a3,
++                                 int64_t *ret_out) {
++    if (!valid_slot(slot_id) || !sym) return ERR_INVALID_ARGS;
++    Slot *s = &slots_[slot_id];
++    if (s->state != SlotState::Loaded || !s->mod) return ERR_NOT_FOUND;
++    atomic_add(&s->inflight_calls, 1);
++    status_t st = lkmod_call4(s->mod, sym, a0, a1, a2, a3, ret_out);
++    atomic_add(&s->inflight_calls, -1);
++    return st;
++}
++
++status_t GaiaModuleManager::call_entry(uint32_t slot_id,
++                                       int64_t a0, int64_t a1, int64_t a2, int64_t a3,
++                                       int64_t *ret_out) {
++    const char *sym = get_entry(slot_id);
++    if (!sym) return ERR_NOT_FOUND;
++    return call(slot_id, sym, a0, a1, a2, a3, ret_out);
++}
++
++status_t GaiaModuleManager::get_info(uint32_t slot_id, Info *out) const {
++    if (!valid_slot(slot_id) || !out) return ERR_INVALID_ARGS;
++    mutex_acquire(&lock_);
++    const Slot &s = slots_[slot_id];
++    out->state = s.state;
++    out->blob_size = s.blob_size;
++    out->blob_capacity = slot_capacity_;
++    out->entry_symbol = (s.entry_symbol[0] != '\0') ? s.entry_symbol : nullptr;
++    out->mod = s.mod;
++    out->mod_base = s.mod ? lkmod_base(s.mod) : 0;
++    out->mod_size = s.mod ? lkmod_size(s.mod) : 0;
++    out->inflight_calls = (uint32_t)s.inflight_calls;
++    mutex_release(&lock_);
++    return NO_ERROR;
++}
++
++GaiaModuleManager::Handle GaiaModuleManager::acquire(uint32_t slot_id) {
++    Handle h; // empty by default
++    if (!valid_slot(slot_id)) return h;
++    mutex_acquire(&lock_);
++    Slot &s = slots_[slot_id];
++    if (s.state == SlotState::Loaded && s.mod) {
++        atomic_add(&s.inflight_calls, 1);
++        h = Handle(this, slot_id);
++    }
++    mutex_release(&lock_);
++    return h;
++}
++
++status_t GaiaModuleManager::acquire(uint32_t slot_id, Handle *out) {
++    if (!out) return ERR_INVALID_ARGS;
++    *out = Handle();
++    if (!valid_slot(slot_id)) return ERR_INVALID_ARGS;
++    mutex_acquire(&lock_);
++    Slot &s = slots_[slot_id];
++    if (s.state != SlotState::Loaded || !s.mod) {
++        mutex_release(&lock_);
++        return ERR_NOT_FOUND;
++    }
++    atomic_add(&s.inflight_calls, 1);
++    *out = Handle(this, slot_id);
++    mutex_release(&lock_);
++    return NO_ERROR;
++}
+diff --git a/lib/lkmodmgr/include/lkmod/gaia_module_manager.h b/lib/lkmodmgr/include/lkmod/gaia_module_manager.h
+new file mode 100644
+index 00000000..09348f0c
+--- /dev/null
++++ b/lib/lkmodmgr/include/lkmod/gaia_module_manager.h
+@@ -0,0 +1,182 @@
++#pragma once
++
++#include <lk/err.h>
++#include <stdint.h>
++#include <stddef.h>
++
++#include <lkmod/lkmod.h>
++
++// Slot-based C++ module manager atop lib/lkmod.
++// Stores ET_DYN ELF blobs in a fixed-capacity per-slot pool and
++// provides slot-indexed load/call/unload operations.
++
++class GaiaModuleManager {
++public:
++    class Handle;
++    enum class SlotState : uint32_t {
++        Empty = 0,
++        Registered,
++        Loaded,
++    };
++
++    struct Config {
++        void *pool_base = nullptr;  // optional external pool base
++        size_t pool_size = 0;       // size of external pool
++        size_t slot_capacity = 0;   // required (>0)
++        uint32_t slot_count = 0;    // required if pool_base == nullptr
++        const lkmod_api_t *api = nullptr; // optional API passed to modules
++    };
++
++    struct Info {
++        SlotState state{};
++        size_t blob_size{};
++        size_t blob_capacity{};
++        const char *entry_symbol{};
++        lkmod_module_t *mod{};
++        uintptr_t mod_base{};
++        size_t mod_size{};
++        uint32_t inflight_calls{};
++    };
++
++    GaiaModuleManager() = default;
++    explicit GaiaModuleManager(const Config &cfg) { (void)init(cfg); }
++    ~GaiaModuleManager();
++
++    GaiaModuleManager(const GaiaModuleManager &) = delete;
++    GaiaModuleManager &operator=(const GaiaModuleManager &) = delete;
++    GaiaModuleManager(GaiaModuleManager &&) = delete;
++    GaiaModuleManager &operator=(GaiaModuleManager &&) = delete;
++
++    status_t init(const Config &cfg);
++    status_t shutdown();
++
++    uint32_t slot_count() const { return slot_count_; }
++    size_t slot_capacity() const { return slot_capacity_; }
++
++    status_t register_blob(uint32_t slot_id, const void *blob, size_t len, bool overwrite=false);
++    status_t unregister_blob(uint32_t slot_id);
++    status_t load(uint32_t slot_id);
++    status_t unload(uint32_t slot_id);
++
++    status_t set_entry(uint32_t slot_id, const char *symbol);
++    const char *get_entry(uint32_t slot_id) const;
++
++    status_t call(uint32_t slot_id, const char *sym,
++                  int64_t a0=0, int64_t a1=0, int64_t a2=0, int64_t a3=0,
++                  int64_t *ret_out=nullptr);
++    status_t call_entry(uint32_t slot_id,
++                        int64_t a0=0, int64_t a1=0, int64_t a2=0, int64_t a3=0,
++                        int64_t *ret_out=nullptr);
++
++    status_t get_info(uint32_t slot_id, Info *out) const;
++
++    // RAII acquisition: returns a handle that pins the slot (refcount++) while alive.
++    // If the slot is not Loaded, returns an empty handle.
++    Handle acquire(uint32_t slot_id);
++    status_t acquire(uint32_t slot_id, Handle *out);
++
++private:
++    struct Slot;
++    friend class Handle;
++
++    bool inited_ = false;
++    void *pool_ = nullptr;
++    size_t pool_size_ = 0;
++    size_t slot_capacity_ = 0;
++    uint32_t slot_count_ = 0;
++    bool pool_owned_ = false;
++    const lkmod_api_t *api_ = nullptr;
++
++    // C-style primitives from LK kernel
++    mutable mutex_t lock_{};
++    Slot *slots_ = nullptr; // array
++
++    bool valid_slot(uint32_t id) const { return inited_ && id < slot_count_; }
++};
++
++// RAII handle that pins a loaded slot to prevent unload while in use.
++class GaiaModuleManager::Handle {
++public:
++    Handle() = default;
++    ~Handle();
++
++    Handle(const Handle &) = delete;
++    Handle &operator=(const Handle &) = delete;
++
++    Handle(Handle &&other) noexcept { move_from(other); }
++    Handle &operator=(Handle &&other) noexcept {
++        if (this != &other) { release(); move_from(other); }
++        return *this;
++    }
++
++    explicit operator bool() const { return mgr_ != nullptr; }
++    uint32_t slot() const { return slot_id_; }
++
++    // Untyped convenience: forwards to manager's call using int64 args
++    status_t call(const char *sym,
++                  int64_t a0=0, int64_t a1=0, int64_t a2=0, int64_t a3=0,
++                  int64_t *ret_out=nullptr) const;
++
++    // Typed call by function signature: R(Args...)
++    // Usage: handle.call<int(int,int)>("hello_add", &ret, 7, 5);
++    template <typename R, typename... Args, R(*Dummy)(Args...) = nullptr>
++    status_t call(const char *sym, R *ret_out, Args... args) const {
++        if (!mgr_ || !sym) return ERR_INVALID_ARGS;
++        GaiaModuleManager::Slot *s = &mgr_->slots_[slot_id_];
++        if (s->state != SlotState::Loaded || !s->mod) return ERR_NOT_FOUND;
++        uintptr_t addr = lkmod_lookup(s->mod, sym);
++        if (!addr) return ERR_NOT_FOUND;
++        using FnPtr = R (*)(Args...);
++        FnPtr fn = reinterpret_cast<FnPtr>(addr);
++        if (ret_out) *ret_out = fn(args...);
++        else {
++            // Allow nullptr ret_out; discard return value
++            (void)fn(args...);
++        }
++        return NO_ERROR;
++    }
++
++    // Typed call for void return: void(Args...)
++    // Usage: handle.call<void(int)>("init", 42);
++    template <typename... Args, void(*Dummy)(Args...) = nullptr>
++    status_t call(const char *sym, Args... args) const {
++        if (!mgr_ || !sym) return ERR_INVALID_ARGS;
++        GaiaModuleManager::Slot *s = &mgr_->slots_[slot_id_];
++        if (s->state != SlotState::Loaded || !s->mod) return ERR_NOT_FOUND;
++        uintptr_t addr = lkmod_lookup(s->mod, sym);
++        if (!addr) return ERR_NOT_FOUND;
++        using FnPtr = void (*)(Args...);
++        FnPtr fn = reinterpret_cast<FnPtr>(addr);
++        fn(args...);
++        return NO_ERROR;
++    }
++
++    // Typed call to preset entry symbol
++    template <typename R, typename... Args, R(*Dummy)(Args...) = nullptr>
++    status_t call_entry(R *ret_out, Args... args) const {
++        const char *sym = mgr_ ? mgr_->get_entry(slot_id_) : nullptr;
++        if (!sym) return ERR_NOT_FOUND;
++        return call<R, Args...>(sym, ret_out, args...);
++    }
++
++    template <typename... Args, void(*Dummy)(Args...) = nullptr>
++    status_t call_entry(Args... args) const {
++        const char *sym = mgr_ ? mgr_->get_entry(slot_id_) : nullptr;
++        if (!sym) return ERR_NOT_FOUND;
++        return call(sym, args...);
++    }
++
++private:
++    friend class GaiaModuleManager; // allow manager to create/move handles
++    GaiaModuleManager *mgr_ = nullptr;
++    uint32_t slot_id_ = 0;
++
++    Handle(GaiaModuleManager *mgr, uint32_t slot_id) : mgr_(mgr), slot_id_(slot_id) {}
++    void move_from(Handle &other) {
++        mgr_ = other.mgr_;
++        slot_id_ = other.slot_id_;
++        other.mgr_ = nullptr;
++        other.slot_id_ = 0;
++    }
++    void release();
++};
+diff --git a/lib/lkmodmgr/rules.mk b/lib/lkmodmgr/rules.mk
+new file mode 100644
+index 00000000..544f4cd6
+--- /dev/null
++++ b/lib/lkmodmgr/rules.mk
+@@ -0,0 +1,10 @@
++LOCAL_DIR := $(GET_LOCAL_DIR)
++
++MODULE := $(LOCAL_DIR)
++
++MODULE_SRCS := \
++	$(LOCAL_DIR)/gaia_module_manager.cpp \
++
++GLOBAL_INCLUDES += $(LOCAL_DIR)/include
++
++include make/module.mk

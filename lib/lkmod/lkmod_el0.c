@@ -17,6 +17,7 @@
 #include <lib/elf_defines.h>
 
 #include <kernel/vm.h>
+#include <kernel/thread.h>
 #include <kernel/uaccess.h>
 #include <arch/mmu.h>
 #include <arch/ops.h>
@@ -93,22 +94,25 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
     st = vmm_alloc(uas, "lkmod-el0-image", span, (void **)&uva_base, 0, 0, arch_flags);
     if (st < 0 || !uva_base) return (st < 0) ? st : ERR_NO_MEMORY;
 
-    // Temporarily make this aspace active so copy_to/from_user use it
-    vmm_aspace_t *old_as = vmm_set_active_aspace(uas);
+    // Temporarily make this aspace active so copy_to/from_user use it.
+    // Save the current aspace explicitly to handle builds where
+    // vmm_set_active_aspace has a void return type.
+    vmm_aspace_t *old_as = get_current_thread()->aspace;
+    vmm_set_active_aspace(uas);
 
     // Copy PT_LOAD segments into UVA
     for (uint i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
         if (ph[i].p_filesz == 0 && ph[i].p_memsz == 0) continue;
         if (ph[i].p_offset + ph[i].p_filesz > len) {
-            (void)vmm_set_active_aspace(old_as);
+            vmm_set_active_aspace(old_as);
             return ERR_NOT_VALID;
         }
         vaddr_t dst_uva = uva_from_vaddr(uva_base, minva_page, ph[i].p_vaddr);
         const void *src = p + ph[i].p_offset;
         if (ph[i].p_filesz) {
             ssize_t wr = copy_to_user(dst_uva, src, (size_t)ph[i].p_filesz);
-            if (wr < 0 || (size_t)wr != ph[i].p_filesz) { (void)vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
+            if (wr < 0 || (size_t)wr != ph[i].p_filesz) { vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
         }
         size_t bss = (ph[i].p_memsz > ph[i].p_filesz) ? (size_t)(ph[i].p_memsz - ph[i].p_filesz) : 0;
         if (bss) {
@@ -118,7 +122,7 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
                 size_t n = bss - off;
                 if (n > sizeof(zero)) n = sizeof(zero);
                 ssize_t wr = copy_to_user(dst_uva + ph[i].p_filesz + off, zero, n);
-                if (wr < 0 || (size_t)wr != n) { (void)vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
+                if (wr < 0 || (size_t)wr != n) { vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
                 off += n;
             }
         }
@@ -144,9 +148,9 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
     if (dyn_uva && dyn_size >= sizeof(struct Elf64_Dyn)) {
         // Copy whole DYNAMIC into temp buffer
         struct Elf64_Dyn *dynbuf = (struct Elf64_Dyn *)malloc(dyn_size);
-        if (!dynbuf) { (void)vmm_set_active_aspace(old_as); return ERR_NO_MEMORY; }
+        if (!dynbuf) { vmm_set_active_aspace(old_as); return ERR_NO_MEMORY; }
         ssize_t rd = copy_from_user(dynbuf, dyn_uva, dyn_size);
-        if (rd < 0 || (size_t)rd != dyn_size) { free(dynbuf); (void)vmm_set_active_aspace(old_as); return (rd < 0) ? (status_t)rd : ERR_IO; }
+        if (rd < 0 || (size_t)rd != dyn_size) { free(dynbuf); vmm_set_active_aspace(old_as); return (rd < 0) ? (status_t)rd : ERR_IO; }
         for (size_t i = 0; i < dyn_size / sizeof(struct Elf64_Dyn); i++) {
             switch (dynbuf[i].d_tag) {
                 case DT_RELA:     rela_addr = dynbuf[i].d_un.d_ptr; break;
@@ -181,9 +185,9 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
     if (rela_addr && rela_size) {
         vaddr_t rela_uva = uva_from_vaddr(uva_base, minva_page, rela_addr);
         struct Elf64_Rela *relas = (struct Elf64_Rela *)malloc((size_t)rela_size);
-        if (!relas) { (void)vmm_set_active_aspace(old_as); return ERR_NO_MEMORY; }
+        if (!relas) { vmm_set_active_aspace(old_as); return ERR_NO_MEMORY; }
         ssize_t r = copy_from_user(relas, rela_uva, (size_t)rela_size);
-        if (r < 0 || (size_t)r != (size_t)rela_size) { free(relas); (void)vmm_set_active_aspace(old_as); return (r < 0) ? (status_t)r : ERR_IO; }
+        if (r < 0 || (size_t)r != (size_t)rela_size) { free(relas); vmm_set_active_aspace(old_as); return (r < 0) ? (status_t)r : ERR_IO; }
         size_t count = (size_t)rela_size / sizeof(struct Elf64_Rela);
         for (size_t i = 0; i < count; i++) {
             uint32_t type = (uint32_t)ELF64_R_TYPE(relas[i].r_info);
@@ -199,8 +203,8 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
                 case R_AARCH64_GLOB_DAT: {
                     struct Elf64_Sym s;
                     st = read_sym(symi, &s);
-                    if (st < 0) { free(relas); (void)vmm_set_active_aspace(old_as); return st; }
-                    if (s.st_shndx == SHN_UNDEF) { free(relas); (void)vmm_set_active_aspace(old_as); return ERR_NOT_SUPPORTED; }
+                    if (st < 0) { free(relas); vmm_set_active_aspace(old_as); return st; }
+                    if (s.st_shndx == SHN_UNDEF) { free(relas); vmm_set_active_aspace(old_as); return ERR_NOT_SUPPORTED; }
                     uint64_t S = (uint64_t)s.st_value + load_bias;
                     val = S + (uint64_t)relas[i].r_addend;
                     break;
@@ -209,20 +213,20 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
                     continue;
                 default:
                     free(relas);
-                    (void)vmm_set_active_aspace(old_as);
+                    vmm_set_active_aspace(old_as);
                     return ERR_NOT_SUPPORTED;
             }
             ssize_t wr = copy_to_user(where, &val, sizeof(val));
-            if (wr < 0 || (size_t)wr != sizeof(val)) { free(relas); (void)vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
+            if (wr < 0 || (size_t)wr != sizeof(val)) { free(relas); vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
         }
         free(relas);
     }
     if (jmprel_addr && pltrel_size) {
         vaddr_t plt_uva = uva_from_vaddr(uva_base, minva_page, jmprel_addr);
         struct Elf64_Rela *relas = (struct Elf64_Rela *)malloc((size_t)pltrel_size);
-        if (!relas) { (void)vmm_set_active_aspace(old_as); return ERR_NO_MEMORY; }
+        if (!relas) { vmm_set_active_aspace(old_as); return ERR_NO_MEMORY; }
         ssize_t r = copy_from_user(relas, plt_uva, (size_t)pltrel_size);
-        if (r < 0 || (size_t)r != (size_t)pltrel_size) { free(relas); (void)vmm_set_active_aspace(old_as); return (r < 0) ? (status_t)r : ERR_IO; }
+        if (r < 0 || (size_t)r != (size_t)pltrel_size) { free(relas); vmm_set_active_aspace(old_as); return (r < 0) ? (status_t)r : ERR_IO; }
         size_t count = (size_t)pltrel_size / sizeof(struct Elf64_Rela);
         for (size_t i = 0; i < count; i++) {
             uint32_t type = (uint32_t)ELF64_R_TYPE(relas[i].r_info);
@@ -237,8 +241,8 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
                 case R_AARCH64_GLOB_DAT: {
                     struct Elf64_Sym s;
                     st = read_sym(symi, &s);
-                    if (st < 0) { free(relas); (void)vmm_set_active_aspace(old_as); return st; }
-                    if (s.st_shndx == SHN_UNDEF) { free(relas); (void)vmm_set_active_aspace(old_as); return ERR_NOT_SUPPORTED; }
+                    if (st < 0) { free(relas); vmm_set_active_aspace(old_as); return st; }
+                    if (s.st_shndx == SHN_UNDEF) { free(relas); vmm_set_active_aspace(old_as); return ERR_NOT_SUPPORTED; }
                     uint64_t S = (uint64_t)s.st_value + load_bias;
                     val = S + (uint64_t)relas[i].r_addend;
                     break;
@@ -247,11 +251,11 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
                     continue;
                 default:
                     free(relas);
-                    (void)vmm_set_active_aspace(old_as);
+                    vmm_set_active_aspace(old_as);
                     return ERR_NOT_SUPPORTED;
             }
             ssize_t wr = copy_to_user(where, &val, sizeof(val));
-            if (wr < 0 || (size_t)wr != sizeof(val)) { free(relas); (void)vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
+            if (wr < 0 || (size_t)wr != sizeof(val)) { free(relas); vmm_set_active_aspace(old_as); return (wr < 0) ? (status_t)wr : ERR_IO; }
         }
         free(relas);
     }
@@ -299,7 +303,7 @@ status_t lkmod_el0_load_image(vmm_aspace_t *uas,
         vaddr_t seg = uva_from_vaddr(uva_base, minva_page, ph[i].p_vaddr);
         arch_sync_cache_range(seg, (size_t)ph[i].p_memsz);
     }
-    (void)vmm_set_active_aspace(old_as);
+    vmm_set_active_aspace(old_as);
 
     if (uva_base_out) *uva_base_out = uva_base;
     if (minva_out) *minva_out = minva_page;
